@@ -1,6 +1,6 @@
 {
   "name": "@alexdochioiu/pi-openai-fast",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "OpenAI fast mode toggle for pi - Enables priority service tier on supported GPT-5 models and sends codex CLI headers",
   "keywords": [
     "pi",

@@ -239,10 +239,91 @@ describe("pi-openai-fast helpers", () => {
 		_test.applyCodexHeaders(headers, { TERM_PROGRAM: "iTerm.app", TERM_PROGRAM_VERSION: "3.5.11" });
 
 		expect(headers).toEqual({
-			"User-Agent": null,
+			"User-Agent": expect.stringMatching(/^codex_cli_rs\/0\.151\.0 \(/),
 			authorization: "Bearer token",
 			originator: "codex_cli_rs",
-			"user-agent": expect.stringMatching(/^codex_cli_rs\/0\.151\.0 \(/),
 		});
+	});
+
+	it("rewrites transport headers only for requests carrying the codex backend marker", () => {
+		const codex = new Headers({ "chatgpt-account-id": "account-123", originator: "pi", "User-Agent": "pi/0.84" });
+		expect(_test.rewriteCodexTransportHeaders(codex, { TERM_PROGRAM: "iTerm.app", TERM_PROGRAM_VERSION: "3.5.11" })).toBe(
+			true,
+		);
+		expect(codex.get("originator")).toBe("codex_cli_rs");
+		expect(codex.get("user-agent")).toMatch(/^codex_cli_rs\/0\.151\.0 \(/);
+		expect(codex.get("chatgpt-account-id")).toBe("account-123");
+
+		const unrelated = new Headers({ authorization: "Bearer token" });
+		expect(_test.rewriteCodexTransportHeaders(unrelated)).toBe(false);
+		expect(unrelated.get("originator")).toBeNull();
+		expect(unrelated.get("user-agent")).toBeNull();
+	});
+
+	it("patches fetch to rewrite codex backend headers before the request goes out", async () => {
+		const seen: Array<{ input: unknown; init: RequestInit | undefined }> = [];
+		const originalFetch = vi.fn(async (input: unknown, init?: RequestInit) => {
+			seen.push({ input, init });
+			return new Response("ok");
+		});
+		const patched = _test.createPatchedFetch(originalFetch as unknown as typeof globalThis.fetch);
+
+		await patched("https://chatgpt.com/backend-api/codex/responses", {
+			headers: { "chatgpt-account-id": "account-123", originator: "pi", "User-Agent": "pi/0.84" },
+		});
+		const codexHeaders = new Headers(seen[0].init?.headers);
+		expect(codexHeaders.get("originator")).toBe("codex_cli_rs");
+		expect(codexHeaders.get("user-agent")).toMatch(/^codex_cli_rs\/0\.151\.0 /);
+
+		await patched("https://api.openai.com/v1/responses", {
+			headers: { authorization: "Bearer token", "User-Agent": "pi/0.84" },
+		});
+		const openaiHeaders = new Headers(seen[1].init?.headers);
+		expect(openaiHeaders.get("User-Agent")).toBe("pi/0.84");
+		expect(openaiHeaders.get("originator")).toBeNull();
+	});
+
+	it("patches the WebSocket constructor to rewrite codex handshake headers", () => {
+		const constructed: Array<{ url: string | URL; options?: unknown }> = [];
+		class FakeWebSocket {
+			constructor(url: string | URL, options?: unknown) {
+				constructed.push({ url, options });
+			}
+		}
+		const Patched = _test.createPatchedWebSocketClass(
+			FakeWebSocket as unknown as new (url: string | URL, options?: unknown) => unknown,
+		);
+
+		new Patched("wss://chatgpt.com/backend-api/codex/responses", {
+			headers: { "chatgpt-account-id": "account-123", originator: "pi", "user-agent": "pi/0.84" },
+		});
+		const codexHeaders = new Headers((constructed[0].options as { headers: unknown }).headers as HeadersInit);
+		expect(codexHeaders.get("originator")).toBe("codex_cli_rs");
+		expect(codexHeaders.get("user-agent")).toMatch(/^codex_cli_rs\/0\.151\.0 /);
+
+		new Patched("wss://example.com/socket", { headers: { authorization: "Bearer token" } });
+		const unrelatedHeaders = new Headers((constructed[1].options as { headers: unknown }).headers as HeadersInit);
+		expect(unrelatedHeaders.get("originator")).toBeNull();
+	});
+
+	it("installs the transport patch once and only once", () => {
+		const globalRecord = globalThis as Record<PropertyKey, unknown>;
+		const originalFetch = globalThis.fetch;
+		const originalWebSocket = globalThis.WebSocket;
+		try {
+			_test.installCodexTransportPatch();
+			const patchedFetch = globalThis.fetch;
+			const patchedWebSocket = globalThis.WebSocket;
+			expect(patchedFetch).not.toBe(originalFetch);
+			expect(patchedWebSocket).not.toBe(originalWebSocket);
+
+			_test.installCodexTransportPatch();
+			expect(globalThis.fetch).toBe(patchedFetch);
+			expect(globalThis.WebSocket).toBe(patchedWebSocket);
+		} finally {
+			globalThis.fetch = originalFetch;
+			globalRecord.WebSocket = originalWebSocket;
+			delete globalRecord[_test.CODEX_TRANSPORT_PATCH_KEY];
+		}
 	});
 });

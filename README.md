@@ -9,6 +9,8 @@ This is a fork of [@benvargas/pi-openai-fast](https://github.com/ben-vargas/pi-p
    - `originator: codex_cli_rs`
    - `User-Agent: codex_cli_rs/0.151.0 (<os> <version>; <arch>) <terminal>` — the format matches `codex-rs/login/src/auth/default_client.rs`, and terminal detection mirrors `codex-rs/terminal-detection/src/lib.rs`.
 
+   The `before_provider_headers` hook wins for the API-key `openai` provider, but pi's `openai-codex` provider force-sets its own `originator: pi` and `User-Agent` *after* the hook runs. To win there too, the extension also patches `globalThis.fetch` and `globalThis.WebSocket` and rewrites the headers of any request carrying the codex backend marker header `chatgpt-account-id` — the last point before the request leaves the process. Other requests (and other providers) are never touched.
+
    The codex version is a constant in `extensions/index.ts` (`CODEX_CLI_VERSION`); bump it there to track new codex releases. Other providers keep their own headers.
 
 This extension does not change the model, thinking level, tools, or prompts. It only adds `service_tier=priority` to provider requests when fast mode is active and the current model matches the configured supported-model list.

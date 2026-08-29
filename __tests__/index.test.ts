@@ -556,8 +556,7 @@ describe("pi-openai-fast", () => {
 		beforeProviderHeaders({ type: "before_provider_headers", headers }, ctx);
 
 		expect(headers.originator).toBe(_test.CODEX_ORIGINATOR);
-		expect(headers["User-Agent"]).toBeNull();
-		expect(headers["user-agent"]).toMatch(new RegExp(`^${_test.CODEX_ORIGINATOR}/${_test.CODEX_CLI_VERSION.replace(/\./g, "\\.")} \\(`));
+		expect(headers["User-Agent"]).toMatch(new RegExp(`^${_test.CODEX_ORIGINATOR}/${_test.CODEX_CLI_VERSION.replace(/\./g, "\\.")} \\(`));
 		expect(headers.authorization).toBe("Bearer token");
 	});
 

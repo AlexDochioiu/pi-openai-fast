@@ -5,6 +5,12 @@ All notable changes to this package will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-08-29
+
+### Fixed
+- pi's `openai-codex` provider stamps `originator: pi` and its own `User-Agent` after the `before_provider_headers` hook runs, overriding the hook's values. The extension now also patches `globalThis.fetch` and `globalThis.WebSocket` and rewrites `originator`/`user-agent` for any request carrying the codex backend marker header `chatgpt-account-id`, so the codex CLI headers actually reach the wire. Requests without the marker are left untouched.
+- The hook now writes the canonical `User-Agent` key so the API-key `openai` provider (which spreads options headers last) ends up with a single, correctly-cased header.
+
 ## [1.2.0] - 2026-08-29
 
 ### Removed

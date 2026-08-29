@@ -22,6 +22,14 @@
  *   (https://github.com/openai/codex, see
  *   `codex-rs/login/src/auth/default_client.rs` and
  *   `codex-rs/terminal-detection/src/lib.rs`).
+ *
+ *   The `before_provider_headers` hook wins for the API-key `openai` provider,
+ *   but pi's `openai-codex` provider force-sets its own `originator: pi` and
+ *   `User-Agent` after the hook runs (see `buildBaseCodexHeaders` in pi's
+ *   dist bundle). To win there too, the extension patches `globalThis.fetch`
+ *   and `globalThis.WebSocket` and rewrites the headers of any request that
+ *   carries the codex backend marker header `chatgpt-account-id` — the last
+ *   point before the bytes hit the wire.
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { arch as osArch, homedir, release as osRelease } from "node:os";
@@ -176,7 +184,97 @@ function applyCodexHeaders(headers: Record<string, string | null>, env: NodeJS.P
 			headers[key] = null;
 		}
 	}
-	headers["user-agent"] = buildCodexUserAgent(env);
+	// Canonical casing: pi's openai (API key) provider spreads these options
+	// headers last, so "User-Agent" cleanly overwrites its own default.
+	headers["User-Agent"] = buildCodexUserAgent(env);
+}
+
+// ---------------------------------------------------------------------------
+// Transport-level codex header rewrite.
+//
+// pi's `openai-codex` provider stamps `originator: pi` and its own User-Agent
+// AFTER the `before_provider_headers` hook (buildBaseCodexHeaders force-sets
+// them), so hook-level changes are overwritten. The provider, however, always
+// attaches the `chatgpt-account-id` marker header and sends its requests
+// through `options.fetch ?? globalThis.fetch` (SSE) and `globalThis.WebSocket`
+// (streaming). Patching those two globals is the last interception point
+// before the request leaves the process; rewriting only requests that carry
+// the marker keeps every other request in the process untouched.
+// ---------------------------------------------------------------------------
+
+type WebSocketConstructorLike = new (url: string | URL, options?: unknown) => unknown;
+
+const CODEX_TRANSPORT_PATCH_KEY = Symbol.for("pi-openai-fast.codex-transport-patched");
+
+function rewriteCodexTransportHeaders(headers: Headers, env: NodeJS.ProcessEnv = process.env): boolean {
+	if (!headers.has("chatgpt-account-id")) {
+		return false;
+	}
+	headers.set("originator", CODEX_ORIGINATOR);
+	headers.set("user-agent", buildCodexUserAgent(env));
+	return true;
+}
+
+function createPatchedFetch(originalFetch: typeof globalThis.fetch): typeof globalThis.fetch {
+	return async (input, init) => {
+		try {
+			if (init?.headers !== undefined) {
+				const headers = new Headers(init.headers);
+				if (rewriteCodexTransportHeaders(headers)) {
+					init.headers = headers;
+				}
+			}
+		} catch {
+			// Never interfere with the request itself.
+		}
+		return originalFetch(input, init);
+	};
+}
+
+function headersToRecord(headers: Headers): Record<string, string> {
+	const record: Record<string, string> = {};
+	// Node's Headers (undici) typings vary across @types/node versions;
+	// iterate through the iterable protocol to stay version-proof.
+	for (const [key, value] of headers as unknown as Iterable<[string, string]>) {
+		record[key] = value;
+	}
+	return record;
+}
+
+function createPatchedWebSocketClass(OriginalWebSocket: WebSocketConstructorLike): WebSocketConstructorLike {
+	return class extends (OriginalWebSocket as unknown as new (url: string | URL, options?: unknown) => object) {
+		constructor(url: string | URL, options?: unknown) {
+			if (options !== null && typeof options === "object" && !Array.isArray(options)) {
+				const record = options as { headers?: unknown };
+				if (record.headers !== undefined) {
+					try {
+						const headers = new Headers(record.headers as HeadersInit);
+						if (rewriteCodexTransportHeaders(headers)) {
+							record.headers = headersToRecord(headers);
+						}
+					} catch {
+						// Leave the handshake headers untouched.
+					}
+				}
+			}
+			super(url, options);
+		}
+	};
+}
+
+function installCodexTransportPatch(): void {
+	const globalRecord = globalThis as Record<PropertyKey, unknown>;
+	if (globalRecord[CODEX_TRANSPORT_PATCH_KEY] === true) {
+		return;
+	}
+	if (typeof globalThis.fetch === "function") {
+		globalThis.fetch = createPatchedFetch(globalThis.fetch);
+	}
+	const WebSocketConstructor = globalRecord.WebSocket;
+	if (typeof WebSocketConstructor === "function") {
+		globalRecord.WebSocket = createPatchedWebSocketClass(WebSocketConstructor as WebSocketConstructorLike);
+	}
+	globalRecord[CODEX_TRANSPORT_PATCH_KEY] = true;
 }
 
 interface FastModeState {
@@ -440,6 +538,8 @@ export default function piOpenAIFast(pi: ExtensionAPI): void {
 	let state: FastModeState = { active: false };
 	let cachedConfig: ResolvedFastConfig | undefined;
 
+	installCodexTransportPatch();
+
 	function refreshConfig(ctx: ExtensionContext): ResolvedFastConfig {
 		cachedConfig = resolveFastConfig(getConfigCwd(ctx));
 		return cachedConfig;
@@ -594,4 +694,9 @@ export const _test = {
 	buildCodexUserAgent,
 	isCodexHeaderProvider,
 	applyCodexHeaders,
+	CODEX_TRANSPORT_PATCH_KEY,
+	rewriteCodexTransportHeaders,
+	createPatchedFetch,
+	createPatchedWebSocketClass,
+	installCodexTransportPatch,
 };
