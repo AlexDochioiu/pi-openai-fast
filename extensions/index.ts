@@ -1,7 +1,8 @@
 /**
  * OpenAI fast mode for pi.
  *
- * `/fast` and `--fast` toggle `service_tier=priority` for configured models.
+ * `/fast` configures `service_tier=priority` per family or via a shared default.
+ * `--fast` enables the default without clearing family overrides.
  * This extension does not change the selected model, thinking level, tools, or prompts.
  *
  * Startup state comes from `pi-openai-fast.json`, not resumed session history.
@@ -39,7 +40,16 @@ import { type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil
 const FAST_COMMAND = "fast";
 const FAST_FLAG = "fast";
 const FAST_CONFIG_BASENAME = "pi-openai-fast.json";
-const FAST_COMMAND_ARGS = ["on", "off", "status"] as const;
+enum FastFamily {
+	Luna = "luna",
+	Terra = "terra",
+	Astra = "astra",
+	Sol = "sol",
+}
+
+const FAST_FAMILIES = Object.values(FastFamily);
+const FAST_COMMAND_ARGS = ["on", "off", "status", "default", ...FAST_FAMILIES] as const;
+type FastFamilyModes = Partial<Record<FastFamily, boolean | "default">>;
 const FAST_SERVICE_TIER = "priority";
 // `openai/gpt-5.4-mini` has an official Fast-mode price and is API-key only: the
 // ChatGPT (openai-codex) catalog exposes no priority tier for gpt-5.4-mini.
@@ -50,13 +60,16 @@ const DEFAULT_SUPPORTED_MODEL_KEYS = [
 	"openai/gpt-5.6-sol",
 	"openai/gpt-5.6-terra",
 	"openai/gpt-5.6-luna",
+	"openai/gpt-6-astra",
 	"openai-codex/gpt-5.4",
 	"openai-codex/gpt-5.5",
 	"openai-codex/gpt-5.6-sol",
 	"openai-codex/gpt-5.6-terra",
 	"openai-codex/gpt-5.6-luna",
+	"openai-codex/gpt-6-astra",
 ] as const;
 const LEGACY_DEFAULT_SUPPORTED_MODEL_KEY_SETS = [
+	DEFAULT_SUPPORTED_MODEL_KEYS.filter((key) => !key.endsWith("-astra")),
 	["openai/gpt-5.4", "openai-codex/gpt-5.4"],
 	["openai/gpt-5.4", "openai/gpt-5.5", "openai-codex/gpt-5.4", "openai-codex/gpt-5.5"],
 	[
@@ -278,7 +291,9 @@ function installCodexTransportPatch(): void {
 }
 
 interface FastModeState {
+	// Legacy `active` is the default for families without an explicit override.
 	active: boolean;
+	families: FastFamilyModes;
 }
 
 interface FastSupportedModel {
@@ -289,6 +304,7 @@ interface FastSupportedModel {
 interface FastConfigFile {
 	persistState?: boolean;
 	active?: boolean;
+	families?: FastFamilyModes;
 	supportedModels?: string[];
 }
 
@@ -296,6 +312,7 @@ interface ResolvedFastConfig {
 	configPath: string;
 	persistState: boolean;
 	active: boolean | undefined;
+	families: FastFamilyModes;
 	supportedModels: FastSupportedModel[];
 }
 
@@ -423,6 +440,15 @@ function readConfigFile(filePath: string): FastConfigFile | null {
 		if (typeof parsed.active === "boolean") {
 			config.active = parsed.active;
 		}
+		if (isRecord(parsed.families)) {
+			config.families = {};
+			for (const family of FAST_FAMILIES) {
+				const mode = parsed.families[family];
+				if (typeof mode === "boolean" || mode === "default") {
+					config.families[family] = mode;
+				}
+			}
+		}
 		const supportedModels = normalizeSupportedModelKeys(parsed.supportedModels);
 		if (supportedModels !== undefined) {
 			config.supportedModels = supportedModels;
@@ -485,6 +511,7 @@ function resolveFastConfig(cwd: string, homeDir?: string): ResolvedFastConfig {
 		configPath: selectedConfigPath,
 		persistState: merged.persistState ?? DEFAULT_CONFIG_FILE.persistState ?? true,
 		active: typeof merged.active === "boolean" ? merged.active : undefined,
+		families: { ...globalConfig.families, ...projectConfig.families },
 		supportedModels,
 	};
 }
@@ -524,6 +551,35 @@ function describeCurrentState(ctx: ExtensionContext, active: boolean, supportedM
 	return `Fast mode is on, but ${model} does not support it. Supported models: ${describeSupportedModels(supportedModels)}.`;
 }
 
+function getFastFamily({ model }: { model: ExtensionContext["model"] }): FastFamily | undefined {
+	if (!model) return undefined;
+	// Match GPT family tokens, not substrings such as "solstice". Eligibility
+	// still requires an exact entry in supportedModels.
+	return FAST_FAMILIES.find((family) => new RegExp(`^gpt-\\d+(?:\\.\\d+)?-${family}(?:-|$)`).test(model.id));
+}
+
+function isFastActive({ state, model }: { state: FastModeState; model: ExtensionContext["model"] }): boolean {
+	const family = getFastFamily({ model });
+	const mode = family === undefined ? undefined : state.families[family];
+	return typeof mode === "boolean" ? mode : state.active;
+}
+
+function describeFastStatus({
+	ctx, state, config,
+}: { ctx: ExtensionContext; state: FastModeState; config: ResolvedFastConfig }): string {
+	const lines = [`Default: ${state.active ? "on" : "off"}`];
+	for (const family of FAST_FAMILIES) {
+		const mode = state.families[family];
+		const explicit = typeof mode === "boolean";
+		const active = explicit ? mode : state.active;
+		const label = `${family[0].toUpperCase()}${family.slice(1)}`;
+		lines.push(`${label}: ${active ? "on" : "off"} (${explicit ? "override" : "default"})`);
+	}
+	lines.push(describeCurrentState(ctx, isFastActive({ state, model: ctx.model }), config.supportedModels));
+	lines.push(`Persistence: ${config.persistState ? "on" : "off"}. Config: ${config.configPath}`);
+	return lines.join("\n");
+}
+
 function applyFastServiceTier(payload: unknown): unknown {
 	if (!isRecord(payload)) {
 		return payload;
@@ -535,7 +591,7 @@ function applyFastServiceTier(payload: unknown): unknown {
 }
 
 export default function piOpenAIFast(pi: ExtensionAPI): void {
-	let state: FastModeState = { active: false };
+	let state: FastModeState = { active: false, families: {} };
 	let cachedConfig: ResolvedFastConfig | undefined;
 
 	installCodexTransportPatch();
@@ -549,99 +605,94 @@ export default function piOpenAIFast(pi: ExtensionAPI): void {
 		return cachedConfig ?? refreshConfig(ctx);
 	}
 
-	function persistState(config: ResolvedFastConfig): void {
-		cachedConfig = { ...config, active: state.active };
+	function persistState({ config, family }: { config: ResolvedFastConfig; family?: FastFamily }): void {
+		cachedConfig = { ...config, active: state.active, families: { ...state.families } };
 		if (!config.persistState) {
 			return;
 		}
-		const nextConfig = { ...(readConfigFile(config.configPath) ?? {}), active: state.active };
+		const nextConfig = readConfigFile(config.configPath) ?? {};
+		if (family === undefined) {
+			nextConfig.active = state.active;
+		} else {
+			// Write only this family's choice; don't pin inherited global settings.
+			nextConfig.families = { ...nextConfig.families, [family]: state.families[family] };
+		}
 		writeConfigFile(config.configPath, nextConfig);
 	}
 
-	async function enableFastMode(ctx: ExtensionContext, options?: { notify?: boolean }): Promise<void> {
+	function setDefaultMode({ ctx, active }: { ctx: ExtensionContext; active: boolean }): void {
 		const config = refreshConfig(ctx);
-		if (state.active) {
-			if (options?.notify !== false) {
-				ctx.ui.notify("Fast mode is already on.", "info");
-			}
-			return;
-		}
-
-		state = { active: true };
-		persistState(config);
-
-		if (options?.notify !== false) {
-			ctx.ui.notify(describeCurrentState(ctx, state.active, config.supportedModels), "info");
-		}
-	}
-
-	async function disableFastMode(ctx: ExtensionContext, options?: { notify?: boolean }): Promise<void> {
-		const config = refreshConfig(ctx);
-		if (!state.active) {
-			if (options?.notify !== false) {
-				ctx.ui.notify("Fast mode is already off.", "info");
-			}
-			return;
-		}
-
-		state = { active: false };
-		persistState(config);
-
-		if (options?.notify !== false) {
-			ctx.ui.notify("Fast mode disabled.", "info");
-		}
-	}
-
-	async function toggleFastMode(ctx: ExtensionContext): Promise<void> {
-		if (state.active) {
-			await disableFastMode(ctx);
-			return;
-		}
-		await enableFastMode(ctx);
+		state = { ...state, active };
+		persistState({ config });
+		ctx.ui.notify(describeFastStatus({ ctx, state, config }), "info");
 	}
 
 	pi.registerFlag(FAST_FLAG, {
-		description: "Start with OpenAI fast mode enabled",
+		description: "Start with the OpenAI fast-mode default enabled (family overrides still apply)",
 		type: "boolean",
 		default: false,
 	});
 
 	pi.registerCommand(FAST_COMMAND, {
-		description: "Toggle fast mode (priority service tier for configured models)",
+		description: "Set fast mode by family or default, or show all fast-mode settings",
 		getArgumentCompletions: (prefix) => {
-			const items = FAST_COMMAND_ARGS.filter((value) => value.startsWith(prefix)).map((value) => ({
+			const normalized = prefix.trimStart().toLowerCase().replace(/\s+/g, " ");
+			const [target] = normalized.split(" ");
+			const choices = normalized.includes(" ")
+				? target === "default"
+					? ["default on", "default off"]
+					: FAST_FAMILIES.some((family) => family === target)
+						? ["on", "off", "default"].map((mode) => `${target} ${mode}`)
+						: []
+				: FAST_COMMAND_ARGS;
+			const items = choices.filter((value) => value.startsWith(normalized)).map((value) => ({
 				value,
 				label: value,
 			}));
 			return items.length > 0 ? items : null;
 		},
 		handler: async (args, ctx) => {
-			const command = args.trim().toLowerCase();
+			const command = args.trim().toLowerCase().replace(/\s+/g, " ");
+			const [target, mode, extra] = command.split(" ");
+			const family = FAST_FAMILIES.find((value) => value === target);
+			if (extra === undefined && family && (mode === "on" || mode === "off" || mode === "default")) {
+				const config = refreshConfig(ctx);
+				state.families[family] = mode === "default" ? "default" : mode === "on";
+				persistState({ config, family });
+				ctx.ui.notify(describeFastStatus({ ctx, state, config }), "info");
+				return;
+			}
 
 			if (command.length === 0) {
-				await toggleFastMode(ctx);
+				setDefaultMode({ ctx, active: !state.active });
 				return;
 			}
 
 			switch (command) {
+				case "default on":
 				case "on":
-					await enableFastMode(ctx);
+					setDefaultMode({ ctx, active: true });
 					return;
+				case "default off":
 				case "off":
-					await disableFastMode(ctx);
+					setDefaultMode({ ctx, active: false });
 					return;
 				case "status":
-					ctx.ui.notify(describeCurrentState(ctx, state.active, refreshConfig(ctx).supportedModels), "info");
+					ctx.ui.notify(describeFastStatus({ ctx, state, config: refreshConfig(ctx) }), "info");
 					return;
 				default:
-					ctx.ui.notify("Usage: /fast [on|off|status]", "error");
+					ctx.ui.notify(
+						"Usage: /fast [on|off|status] | /fast default <on|off> | " +
+							"/fast <luna|terra|astra|sol> <on|off|default>",
+						"error",
+					);
 			}
 		},
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {
 		const config = getConfig(ctx);
-		if (!state.active || !isFastSupportedModel(ctx.model, config.supportedModels)) {
+		if (!isFastActive({ state, model: ctx.model }) || !isFastSupportedModel(ctx.model, config.supportedModels)) {
 			return;
 		}
 		return applyFastServiceTier(event.payload);
@@ -656,19 +707,24 @@ export default function piOpenAIFast(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		const config = refreshConfig(ctx);
-		state = config.persistState && typeof config.active === "boolean" ? { active: config.active } : { active: false };
+		state = config.persistState
+			? { active: config.active ?? false, families: { ...config.families } }
+			: { active: false, families: {} };
 
 		// Session startup is intentionally silent: enabling/disabling fast mode
 		// here does not send notifications.
 		if (pi.getFlag(FAST_FLAG) === true && !state.active) {
-			state = { active: true };
-			persistState(config);
+			state = { ...state, active: true };
+			persistState({ config });
 		}
 	});
 }
 
 export const _test = {
 	FAST_COMMAND,
+	FAST_FAMILIES,
+	getFastFamily,
+	isFastActive,
 	FAST_FLAG,
 	FAST_CONFIG_BASENAME,
 	FAST_COMMAND_ARGS,

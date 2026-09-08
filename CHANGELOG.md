@@ -5,6 +5,18 @@ All notable changes to this package will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Per-family fast-mode overrides for Luna, Terra, Astra, and Sol: `/fast <family> on|off|default`.
+- `/fast default on|off` sets the fallback, preserving the existing `active` config field and legacy commands.
+- `/fast status` now reports all families, inheritance, the current model, persistence, and config path.
+- Target and mode argument completion, per-family project/global config merging, and persisted default resets.
+- `openai/gpt-6-astra` and `openai-codex/gpt-6-astra` in the default supported models; older default lists migrate automatically.
+
+### Changed
+- `/fast`, `/fast on|off`, and `--fast` control the default without clearing family overrides.
+
 ## [1.2.1] - 2026-08-29
 
 ### Fixed

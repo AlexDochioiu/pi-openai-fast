@@ -134,6 +134,156 @@ function getRegisteredHandler(mockPi: MockPi, eventName: string): (event: unknow
 	return handler;
 }
 
+describe("per-family fast mode", () => {
+	it("applies overrides across model switches and providers, persists them, and reports every family", async () => {
+		const { cwd, homeDir, cleanup } = createTempWorkspace();
+		try {
+			vi.stubEnv("HOME", homeDir);
+			const mockPi = createMockPi();
+			piOpenAIFast(mockPi as unknown as ExtensionAPI);
+			const { ctx, ui } = createMockContext(undefined, [], cwd);
+			const command = getRegisteredCommand(mockPi, "fast");
+			const start = getRegisteredHandler(mockPi, "session_start");
+			const request = getRegisteredHandler(mockPi, "before_provider_request");
+			await start({}, ctx);
+			await command.handler("default on", ctx);
+			await command.handler("  AsTrA   OFF  ", ctx);
+			await command.handler("sol on", ctx);
+			await command.handler("terra off", ctx);
+			await command.handler("terra default", ctx);
+			for (const provider of ["openai", "openai-codex"]) {
+				for (const id of ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra", "gpt-5.5"]) {
+					ctx.model = { provider, id } as ExtensionContext["model"];
+					const result = request({ payload: { input: "hello" } }, ctx);
+					expect(result).toEqual(id === "gpt-6-astra" ? undefined : { input: "hello", service_tier: "priority" });
+				}
+			}
+			ctx.model = undefined;
+			await command.handler("status", ctx);
+			expect(ui.notify).toHaveBeenLastCalledWith(expect.stringContaining([
+				"Default: on", "Luna: on (default)", "Terra: on (default)",
+				"Astra: off (override)", "Sol: on (override)",
+			].join("\n")), "info");
+
+			const { globalConfigPath } = _test.getConfigPaths(cwd, homeDir);
+			expect(_test.readConfigFile(globalConfigPath)).toMatchObject({
+				active: true, families: { astra: false, sol: true, terra: "default" },
+			});
+			// A fresh instance must restore family choices, not just the default.
+			const restoredPi = createMockPi();
+			piOpenAIFast(restoredPi as unknown as ExtensionAPI);
+			await getRegisteredHandler(restoredPi, "session_start")({}, ctx);
+			await getRegisteredCommand(restoredPi, "fast").handler("status", ctx);
+			expect(ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("Astra: off (override)"), "info");
+
+			// Legacy aliases and bare toggle change only the default.
+			for (const input of ["off", "", "default off", "on", "off"]) await command.handler(input, ctx);
+			ctx.model = { provider: "openai", id: "gpt-5.6-sol" } as ExtensionContext["model"];
+			expect(request({ payload: {} }, ctx)).toEqual({ service_tier: "priority" });
+			ctx.model = { provider: "openai", id: "gpt-5.6-terra" } as ExtensionContext["model"];
+			expect(request({ payload: {} }, ctx)).toBeUndefined();
+			await command.handler("astra on", ctx);
+			ctx.model = { provider: "openai-codex", id: "gpt-6-astra" } as ExtensionContext["model"];
+			expect(request({ payload: {} }, ctx)).toEqual({ service_tier: "priority" });
+		} finally { cleanup(); }
+	});
+
+	it("merges families individually and persists project default resets without pinning global values", async () => {
+		const { cwd, homeDir, cleanup } = createTempWorkspace();
+		try {
+			vi.stubEnv("HOME", homeDir);
+			const { globalConfigPath, projectConfigPath } = _test.getConfigPaths(cwd, homeDir);
+			mkdirSync(join(homeDir, ".pi", "agent", "extensions"), { recursive: true });
+			mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
+			const globalConfig = { active: true, families: { terra: false, astra: false, sol: true } };
+			writeFileSync(globalConfigPath, JSON.stringify(globalConfig));
+			writeFileSync(projectConfigPath, JSON.stringify({ families: { astra: true } }));
+			const mockPi = createMockPi();
+			piOpenAIFast(mockPi as unknown as ExtensionAPI);
+			const { ctx } = createMockContext({ provider: "openai", id: "gpt-5.6-terra" } as ExtensionContext["model"], [], cwd);
+			const start = getRegisteredHandler(mockPi, "session_start");
+			const request = getRegisteredHandler(mockPi, "before_provider_request");
+			await start({}, ctx);
+			expect(request({ payload: {} }, ctx)).toBeUndefined();
+			await getRegisteredCommand(mockPi, "fast").handler("terra default", ctx);
+			await start({}, ctx);
+			expect(request({ payload: {} }, ctx)).toEqual({ service_tier: "priority" });
+			expect(_test.readConfigFile(projectConfigPath)).toEqual({ families: { astra: true, terra: "default" } });
+			expect(_test.readConfigFile(globalConfigPath)).toEqual(globalConfig);
+			expect(_test.resolveFastConfig(cwd, homeDir).families).toEqual({ astra: true, terra: "default", sol: true });
+		} finally { cleanup(); }
+	});
+
+	it("keeps non-persistent overrides session-local and does not bypass supportedModels", async () => {
+		const { cwd, homeDir, cleanup } = createTempWorkspace();
+		try {
+			vi.stubEnv("HOME", homeDir);
+			const { globalConfigPath } = _test.getConfigPaths(cwd, homeDir);
+			mkdirSync(join(homeDir, ".pi", "agent", "extensions"), { recursive: true });
+			const config = { persistState: false, active: true, families: { luna: true }, supportedModels: ["openai/gpt-5.6-luna"] };
+			writeFileSync(globalConfigPath, JSON.stringify(config));
+			const mockPi = createMockPi();
+			piOpenAIFast(mockPi as unknown as ExtensionAPI);
+			const { ctx } = createMockContext({ provider: "openai", id: "gpt-5.6-luna" } as ExtensionContext["model"], [], cwd);
+			const start = getRegisteredHandler(mockPi, "session_start");
+			const request = getRegisteredHandler(mockPi, "before_provider_request");
+			const command = getRegisteredCommand(mockPi, "fast");
+			await start({}, ctx);
+			expect(request({ payload: {} }, ctx)).toBeUndefined();
+			await command.handler("luna on", ctx);
+			await command.handler("status", ctx);
+			expect(request({ payload: {} }, ctx)).toEqual({ service_tier: "priority" });
+			ctx.model = { provider: "openai-codex", id: "gpt-5.6-luna" } as ExtensionContext["model"];
+			expect(request({ payload: {} }, ctx)).toBeUndefined();
+			ctx.model = { provider: "openai", id: "gpt-5.6-luna" } as ExtensionContext["model"];
+			await start({}, ctx);
+			expect(request({ payload: {} }, ctx)).toBeUndefined();
+			expect(_test.readConfigFile(globalConfigPath)).toEqual(config);
+		} finally { cleanup(); }
+	});
+
+	it("honors family overrides with --fast and stays silent on startup", async () => {
+		const { cwd, homeDir, cleanup } = createTempWorkspace();
+		try {
+			vi.stubEnv("HOME", homeDir);
+			const { globalConfigPath } = _test.getConfigPaths(cwd, homeDir);
+			mkdirSync(join(homeDir, ".pi", "agent", "extensions"), { recursive: true });
+			writeFileSync(globalConfigPath, JSON.stringify({ active: false, families: { astra: false } }));
+			const mockPi = createMockPi(true);
+			piOpenAIFast(mockPi as unknown as ExtensionAPI);
+			const { ctx, ui } = createMockContext({ provider: "openai", id: "gpt-6-astra" } as ExtensionContext["model"], [], cwd);
+			await getRegisteredHandler(mockPi, "session_start")({}, ctx);
+			expect(ui.notify).not.toHaveBeenCalled();
+			expect(getRegisteredHandler(mockPi, "before_provider_request")({ payload: {} }, ctx)).toBeUndefined();
+			expect(_test.readConfigFile(globalConfigPath)).toEqual({ active: true, families: { astra: false } });
+		} finally { cleanup(); }
+	});
+
+	it("completes targets and modes and rejects invalid commands without modifying state", async () => {
+		const { cwd, homeDir, cleanup } = createTempWorkspace();
+		try {
+			vi.stubEnv("HOME", homeDir);
+			const mockPi = createMockPi();
+			piOpenAIFast(mockPi as unknown as ExtensionAPI);
+			const command = getRegisteredCommand(mockPi, "fast");
+			const { ctx, ui } = createMockContext(undefined, [], cwd);
+			await getRegisteredHandler(mockPi, "session_start")({}, ctx);
+			const { globalConfigPath } = _test.getConfigPaths(cwd, homeDir);
+			const before = readFileSync(globalConfigPath, "utf8");
+			for (const invalid of ["default", "default default", "astra", "astra maybe", "sol on extra", "unknown on", "status on"]) {
+				await command.handler(invalid, ctx);
+				expect(ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("Usage:"), "error");
+			}
+			expect(readFileSync(globalConfigPath, "utf8")).toBe(before);
+			expect((await command.getArgumentCompletions?.(""))?.map((item) => item.value)).toEqual(_test.FAST_COMMAND_ARGS);
+			expect((await command.getArgumentCompletions?.("astra "))?.map((item) => item.value)).toEqual(["astra on", "astra off", "astra default"]);
+			expect((await command.getArgumentCompletions?.("default "))?.map((item) => item.value)).toEqual(["default on", "default off"]);
+			expect(await command.getArgumentCompletions?.("Terra   d")).toEqual([{ value: "terra default", label: "terra default" }]);
+			expect(await command.getArgumentCompletions?.("sol bad")).toBeNull();
+		} finally { cleanup(); }
+	});
+});
+
 describe("pi-openai-fast", () => {
 	it("registers the fast command and flag", () => {
 		const mockPi = createMockPi();
@@ -141,7 +291,7 @@ describe("pi-openai-fast", () => {
 
 		expect(mockPi.commands.has("fast")).toBe(true);
 		expect(mockPi.flags.get("fast")).toEqual({
-			description: "Start with OpenAI fast mode enabled",
+			description: "Start with the OpenAI fast-mode default enabled (family overrides still apply)",
 			type: "boolean",
 			default: false,
 		});
@@ -169,7 +319,7 @@ describe("pi-openai-fast", () => {
 			await command.handler("on", ctx);
 
 			expect(mockPi.appendEntry).not.toHaveBeenCalled();
-			expect(ui.notify).toHaveBeenCalledWith("Fast mode is on for openai/gpt-5.4.", "info");
+			expect(ui.notify).toHaveBeenCalledWith(expect.stringContaining("Fast mode is on for openai/gpt-5.4."), "info");
 
 			const payload = beforeProviderRequest(
 				{ type: "before_provider_request", payload: { input: "hello" } } as BeforeProviderRequestEvent,
@@ -210,7 +360,7 @@ describe("pi-openai-fast", () => {
 			await command.handler("on", ctx);
 
 			expect(ui.notify).toHaveBeenCalledWith(
-				`Fast mode is on, but anthropic/claude-sonnet-4 does not support it. Supported models: ${_test.DEFAULT_SUPPORTED_MODEL_KEYS.join(", ")}.`,
+				expect.stringContaining(`Fast mode is on, but anthropic/claude-sonnet-4 does not support it. Supported models: ${_test.DEFAULT_SUPPORTED_MODEL_KEYS.join(", ")}.`),
 				"info",
 			);
 
@@ -349,7 +499,7 @@ describe("pi-openai-fast", () => {
 
 			await command.handler("status", ctx);
 			expect(ui.notify).toHaveBeenLastCalledWith(
-				"Fast mode is on, but openai/gpt-5.5 does not support it. Supported models: openai/gpt-5.4.",
+				expect.stringContaining("Fast mode is on, but openai/gpt-5.5 does not support it. Supported models: openai/gpt-5.4."),
 				"info",
 			);
 			expect(

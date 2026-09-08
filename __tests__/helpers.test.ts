@@ -27,6 +27,39 @@ function createTempConfigPaths(): { cwd: string; homeDir: string; cleanup: () =>
 }
 
 describe("pi-openai-fast helpers", () => {
+	it("recognizes bounded GPT family names and falls back for other models", () => {
+		for (const [id, expected] of [
+			["gpt-5.6-luna", "luna"], ["gpt-5.6-terra", "terra"],
+			["gpt-6-astra", "astra"], ["gpt-6-astra-2026-09-01", "astra"],
+			["gpt-5.6-sol", "sol"], ["gpt-5.6-solstice", undefined],
+			["gpt-5.5", undefined], ["custom-sol", undefined],
+		]) {
+			const model = { provider: "openai", id } as ExtensionContext["model"];
+			expect(_test.getFastFamily({ model })).toBe(expected);
+		}
+		expect(_test.getFastFamily({ model: undefined })).toBeUndefined();
+	});
+
+	it("ignores malformed family values without hiding valid global choices", () => {
+		const { cwd, homeDir, cleanup } = createTempConfigPaths();
+		try {
+			const { projectConfigPath, globalConfigPath } = _test.getConfigPaths(cwd, homeDir);
+			mkdirSync(join(homeDir, ".pi", "agent", "extensions"), { recursive: true });
+			mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
+			writeFileSync(globalConfigPath, JSON.stringify({ families: { astra: false, sol: true } }));
+			writeFileSync(projectConfigPath, JSON.stringify({
+				families: { astra: "off", sol: null, terra: "default", luna: true, unknown: true },
+			}));
+			expect(_test.resolveFastConfig(cwd, homeDir).families).toEqual({
+				astra: false, sol: true, terra: "default", luna: true,
+			});
+			for (const families of [null, [], "on", 1]) {
+				writeFileSync(projectConfigPath, JSON.stringify({ families }));
+				expect(_test.resolveFastConfig(cwd, homeDir).families).toEqual({ astra: false, sol: true });
+			}
+		} finally { cleanup(); }
+	});
+
 	it("parses supported model keys and recognizes supported fast models", () => {
 		const supportedModels = _test.parseSupportedModels(_test.DEFAULT_SUPPORTED_MODEL_KEYS) ?? [];
 		expect(_test.parseSupportedModelKey("openai/gpt-5.4")).toEqual({ provider: "openai", id: "gpt-5.4" });
@@ -101,11 +134,13 @@ describe("pi-openai-fast helpers", () => {
 				{ provider: "openai", id: "gpt-5.6-sol" },
 				{ provider: "openai", id: "gpt-5.6-terra" },
 				{ provider: "openai", id: "gpt-5.6-luna" },
+				{ provider: "openai", id: "gpt-6-astra" },
 				{ provider: "openai-codex", id: "gpt-5.4" },
 				{ provider: "openai-codex", id: "gpt-5.5" },
 				{ provider: "openai-codex", id: "gpt-5.6-sol" },
 				{ provider: "openai-codex", id: "gpt-5.6-terra" },
 				{ provider: "openai-codex", id: "gpt-5.6-luna" },
+				{ provider: "openai-codex", id: "gpt-6-astra" },
 			]);
 
 			const { projectConfigPath, globalConfigPath } = _test.getConfigPaths(cwd, homeDir);
