@@ -16,6 +16,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `/fast`, `/fast on|off`, and `--fast` control the default without clearing family overrides.
+- Update the development Pi harness to 1.3.0 and refresh its dependency lockfile to resolve npm audit findings in `undici`, `brace-expansion`, and `source-map-js`. The runtime peer minimum remains unchanged.
 
 ## [1.2.1] - 2026-08-29
 
